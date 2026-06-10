@@ -3,18 +3,18 @@ the static datastore dashboard."""
 import datetime as _dt
 import logging
 import os
-import secrets
 import threading
 import time
 
 import psycopg
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import db, ingest, read, store
 from .analysis import daily
+from .auth import AuthContext, authorize_device, require_admin_auth, require_auth
 from .config import load_config
 
 _log = logging.getLogger("goose.ingest")
@@ -52,12 +52,6 @@ def dashboard():
 def architecture():
     """Serve the device-link architecture page (how we talk to the strap, no byte detail)."""
     return FileResponse(os.path.join(_STATIC, "architecture.html"))
-
-
-def require_auth(authorization: str = Header(default="")) -> None:
-    expected = f"Bearer {cfg.api_key}"
-    if not secrets.compare_digest(authorization, expected):
-        raise HTTPException(status_code=401, detail="unauthorized")
 
 
 class Frame(BaseModel):
@@ -173,6 +167,27 @@ class DecodedBatch(BaseModel):
     device_generation: str | None = "5.0"
 
 
+class RawFrame(BaseModel):
+    captured_at_unix: float = Field(..., ge=0)
+    frame_hex: str = Field(..., min_length=2, pattern=r"^[0-9a-fA-F]+$")
+    source: str | None = None
+    device_type: str | None = None
+    device_model: str | None = None
+    sensitivity: str | None = None
+
+    @field_validator("frame_hex")
+    @classmethod
+    def frame_hex_even_length(cls, value: str) -> str:
+        if len(value) % 2 != 0:
+            raise ValueError("frame_hex must have even length (complete bytes)")
+        return value
+
+
+class RawFrameBatch(BaseModel):
+    device: DecodedDevice
+    frames: list[RawFrame]
+
+
 @app.get("/healthz")
 def healthz():
     try:
@@ -183,10 +198,13 @@ def healthz():
         raise HTTPException(status_code=503, detail="db unavailable")
 
 
-@app.post("/v1/ingest", dependencies=[Depends(require_auth)])
-def ingest_batch(batch: IngestBatch):
+@app.post("/v1/ingest")
+def ingest_batch(batch: IngestBatch, auth: AuthContext = Depends(require_auth)):
     payload = batch.model_dump()
     with psycopg.connect(cfg.db_dsn) as conn:
+        device = payload["device"]
+        store.ensure_device(conn, device["device_id"], mac=device.get("mac"), name=device.get("name"))
+        authorize_device(conn, auth, device["device_id"], auto_bind=True)
         result = ingest.process_batch(conn, cfg, payload)
         conn.commit()
     return result
@@ -204,14 +222,15 @@ def _batch_dates_utc(streams: dict) -> set[_dt.date]:
     return days
 
 
-@app.post("/v1/ingest-decoded", dependencies=[Depends(require_auth)])
-def ingest_decoded(batch: DecodedBatch):
+@app.post("/v1/ingest-decoded")
+def ingest_decoded(batch: DecodedBatch, auth: AuthContext = Depends(require_auth)):
     payload = batch.model_dump()
     device_id = payload["device"]["id"]
     with psycopg.connect(cfg.db_dsn) as conn:
         store.ensure_device(conn, device_id,
                             mac=payload["device"].get("mac"),
                             name=payload["device"].get("name"))
+        authorize_device(conn, auth, device_id, auto_bind=True)
         counts = store.upsert_streams(conn, device_id, payload["streams"])
         conn.commit()
         # Recompute the day(s) this batch touched — throttled (see _RECOMPUTE_*).
@@ -235,19 +254,46 @@ def ingest_decoded(batch: DecodedBatch):
     return {"upserted": counts}
 
 
-@app.get("/v1/devices", dependencies=[Depends(require_auth)])
-def get_devices():
+@app.post("/v1/ingest-frames")
+def ingest_frames(batch: RawFrameBatch, auth: AuthContext = Depends(require_auth)):
+    payload = batch.model_dump()
+    device_id = payload["device"]["id"]
     with psycopg.connect(cfg.db_dsn) as conn:
-        return read.list_devices(conn)
+        store.ensure_device(
+            conn,
+            device_id,
+            mac=payload["device"].get("mac"),
+            name=payload["device"].get("name"),
+        )
+        authorize_device(conn, auth, device_id, auto_bind=True)
+        inserted = store.insert_raw_frames(conn, device_id, payload["frames"])
+        conn.commit()
+    return {"inserted": inserted}
 
 
-@app.get("/v1/batches", dependencies=[Depends(require_auth)])
+@app.get("/v1/me")
+def get_me(auth: AuthContext = Depends(require_auth)):
+    if auth.is_admin:
+        return {"role": "admin", "user": None}
+    return {
+        "role": "user",
+        "user": {"id": str(auth.user_id), "name": auth.name, "email": auth.email},
+    }
+
+
+@app.get("/v1/devices")
+def get_devices(auth: AuthContext = Depends(require_auth)):
+    with psycopg.connect(cfg.db_dsn) as conn:
+        return read.list_devices(conn, user_id=None if auth.is_admin else auth.user_id)
+
+
+@app.get("/v1/batches", dependencies=[Depends(require_admin_auth)])
 def get_batches(device: str, limit: int = Query(100, ge=1, le=10000)):
     with psycopg.connect(cfg.db_dsn) as conn:
         return read.list_batches(conn, device_id=device, limit=limit)
 
 
-@app.get("/v1/summary", dependencies=[Depends(require_auth)])
+@app.get("/v1/summary", dependencies=[Depends(require_admin_auth)])
 def get_summary(device: str,
                 from_: int = Query(0, alias="from"),
                 to: int = Query(2_000_000_000, alias="to")):
@@ -256,7 +302,7 @@ def get_summary(device: str,
         return read.counts(conn, device_id=device, start=from_, end=to)
 
 
-@app.get("/v1/streams/{kind}", dependencies=[Depends(require_auth)])
+@app.get("/v1/streams/{kind}", dependencies=[Depends(require_admin_auth)])
 def get_stream(kind: str, device: str,
                from_: int = Query(0, alias="from"),
                to: int = Query(2_000_000_000, alias="to"),
@@ -284,7 +330,7 @@ def _parse_date(s: str) -> _dt.date:
         raise HTTPException(status_code=400, detail=f"invalid date (want YYYY-MM-DD): {s!r}")
 
 
-@app.post("/v1/compute-daily", dependencies=[Depends(require_auth)])
+@app.post("/v1/compute-daily", dependencies=[Depends(require_admin_auth)])
 def compute_daily(body: ComputeDaily):
     """Compute + persist the daily metrics for a device/date, returning the summary."""
     day = _parse_date(body.date)
@@ -294,7 +340,7 @@ def compute_daily(body: ComputeDaily):
     return result
 
 
-@app.get("/v1/daily", dependencies=[Depends(require_auth)])
+@app.get("/v1/daily", dependencies=[Depends(require_admin_auth)])
 def get_daily(device: str,
               from_: str = Query(..., alias="from"),
               to: str = Query(..., alias="to")):
@@ -304,14 +350,14 @@ def get_daily(device: str,
         return read.query_daily(conn, device, start, end)
 
 
-@app.get("/v1/today", dependencies=[Depends(require_auth)])
+@app.get("/v1/today", dependencies=[Depends(require_admin_auth)])
 def get_today(device: str):
     """Most-recent daily_metrics row for the device (ORDER BY day DESC LIMIT 1), or null."""
     with psycopg.connect(cfg.db_dsn) as conn:
         return read.query_today(conn, device)
 
 
-@app.get("/v1/sleep", dependencies=[Depends(require_auth)])
+@app.get("/v1/sleep", dependencies=[Depends(require_admin_auth)])
 def get_sleep(device: str, date: str):
     """Sleep sessions whose night ENDS on ``date`` (YYYY-MM-DD)."""
     day = _parse_date(date)
@@ -332,7 +378,7 @@ class ProfileBody(BaseModel):
     sex: str | None = None
 
 
-@app.get("/v1/profile", dependencies=[Depends(require_auth)])
+@app.get("/v1/profile", dependencies=[Depends(require_admin_auth)])
 def get_profile(device: str):
     """Return the stored profile for a device, or {} if none exists."""
     with psycopg.connect(cfg.db_dsn) as conn:
@@ -340,7 +386,7 @@ def get_profile(device: str):
     return row or {}
 
 
-@app.post("/v1/profile", dependencies=[Depends(require_auth)])
+@app.post("/v1/profile", dependencies=[Depends(require_admin_auth)])
 def upsert_profile(body: ProfileBody):
     """Create or update the user profile (height/weight/age/sex) for a device."""
     sex = body.sex
@@ -365,7 +411,7 @@ def upsert_profile(body: ProfileBody):
 
 # ── Workouts endpoint ─────────────────────────────────────────────────────────
 
-@app.get("/v1/workouts", dependencies=[Depends(require_auth)])
+@app.get("/v1/workouts", dependencies=[Depends(require_admin_auth)])
 def get_workouts(device: str,
                  from_: str = Query(..., alias="from"),
                  to: str = Query(..., alias="to")):
@@ -388,7 +434,7 @@ class BackfillWorkouts(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-@app.post("/v1/backfill-workouts", dependencies=[Depends(require_auth)])
+@app.post("/v1/backfill-workouts", dependencies=[Depends(require_admin_auth)])
 def backfill_workouts(body: BackfillWorkouts):
     """Recompute exercise sessions (with calories) over a date range by replaying
     compute_day for each date. Idempotent — safe to re-run. May be slow for large
@@ -424,7 +470,7 @@ def backfill_workouts(body: BackfillWorkouts):
     return {"recomputed": len(results), "days": results}
 
 
-@app.get("/v1/export/frames/{device_id}", dependencies=[Depends(require_auth)])
+@app.get("/v1/export/frames/{device_id}", dependencies=[Depends(require_admin_auth)])
 def export_device_frames(
     device_id: str,
     from_: float = Query(0.0, alias="from", ge=0.0),
@@ -439,7 +485,7 @@ def export_device_frames(
     return {"device_id": device_id, "frames": frames, "count": len(frames)}
 
 
-@app.get("/v1/batches/{batch_id}/frames", dependencies=[Depends(require_auth)])
+@app.get("/v1/batches/{batch_id}/frames", dependencies=[Depends(require_admin_auth)])
 def get_batch_frames(batch_id: str):
     with psycopg.connect(cfg.db_dsn) as conn:
         row = conn.execute(

@@ -48,10 +48,20 @@ _DOWNSAMPLE = {
 }
 
 
-def list_devices(conn):
-    rows = conn.execute(
-        "SELECT device_id, mac, name, first_seen, last_seen FROM devices ORDER BY device_id"
-    ).fetchall()
+def list_devices(conn, user_id=None):
+    if user_id is None:
+        rows = conn.execute(
+            "SELECT device_id, mac, name, first_seen, last_seen FROM devices ORDER BY device_id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT d.device_id, d.mac, d.name, d.first_seen, d.last_seen
+               FROM devices d
+               JOIN device_owners o ON o.device_id = d.device_id
+               WHERE o.user_id = %s
+               ORDER BY d.device_id""",
+            (user_id,),
+        ).fetchall()
     cols = ["device_id", "mac", "name", "first_seen", "last_seen"]
     return [dict(zip(cols, r)) for r in rows]
 
@@ -296,10 +306,34 @@ def query_workouts(conn, device_id, start_date, end_date):
 def read_device_frames(conn, device_id: str, from_ts: float, to_ts: float, limit: int = 5000):
     """Return raw frames for a device in [from_ts, to_ts] unix seconds, paginatable.
 
+    Frames uploaded directly by iOS are authoritative and returned when present.
+    Older deployments fall back to reconstructing timestamps from archived batches.
     Timestamps are interpolated linearly within each batch's [start_ts, end_ts] window.
     Returns list of dicts compatible with the iOS capture.import_frame_batch format:
       {captured_at_unix, frame_hex, source, device_model, device_type, sensitivity}
     """
+    rows = conn.execute(
+        """SELECT extract(epoch FROM captured_at)::float, frame_hex, source,
+                  device_model, device_type, sensitivity
+           FROM raw_frames
+           WHERE device_id = %s
+             AND captured_at >= to_timestamp(%s)
+             AND captured_at <= to_timestamp(%s)
+           ORDER BY captured_at
+           LIMIT %s""",
+        (device_id, from_ts, to_ts, limit),
+    ).fetchall()
+    if rows:
+        cols = [
+            "captured_at_unix",
+            "frame_hex",
+            "source",
+            "device_model",
+            "device_type",
+            "sensitivity",
+        ]
+        return [dict(zip(cols, row)) for row in rows]
+
     name_row = conn.execute(
         "SELECT name FROM devices WHERE device_id = %s", (device_id,)
     ).fetchone()
