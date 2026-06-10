@@ -84,7 +84,8 @@ def authorize_device(
         if not auto_bind:
             raise HTTPException(status_code=403, detail="device is not owned by this user")
         conn.execute(
-            "INSERT INTO device_owners (device_id, user_id) VALUES (%s, %s)",
+            """INSERT INTO device_owners (device_id, user_id, display_name)
+               VALUES (%s, %s, NULL)""",
             (device_id, auth.user_id),
         )
         return

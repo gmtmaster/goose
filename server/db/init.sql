@@ -31,12 +31,14 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 CREATE UNIQUE INDEX IF NOT EXISTS api_tokens_token_hash ON api_tokens (token_hash);
 
 CREATE TABLE IF NOT EXISTS device_owners (
-    device_id  TEXT REFERENCES devices(device_id),
-    user_id    UUID REFERENCES users(id),
-    nickname   TEXT,
-    created_at TIMESTAMPTZ DEFAULT now(),
+    device_id    TEXT REFERENCES devices(device_id),
+    user_id      UUID REFERENCES users(id),
+    nickname     TEXT,
+    display_name TEXT,
+    created_at   TIMESTAMPTZ DEFAULT now(),
     PRIMARY KEY (device_id, user_id)
 );
+ALTER TABLE device_owners ADD COLUMN IF NOT EXISTS display_name TEXT;
 -- Phase 1 assigns each physical device to exactly one user. The composite PK
 -- leaves room for a future sharing migration, while this index enforces today's
 -- exclusive-owner rule and closes concurrent first-upload races.

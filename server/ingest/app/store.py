@@ -38,6 +38,20 @@ def insert_raw_frames(conn: psycopg.Connection, device_id: str, frames: list[dic
     return inserted
 
 
+def set_device_display_name(
+    conn: psycopg.Connection,
+    device_id: str,
+    display_name: str,
+) -> tuple | None:
+    return conn.execute(
+        """UPDATE device_owners
+           SET display_name = %s
+           WHERE device_id = %s
+           RETURNING user_id, nickname, created_at""",
+        (display_name, device_id),
+    ).fetchone()
+
+
 def batch_exists(conn: psycopg.Connection, batch_id: str) -> bool:
     row = conn.execute("SELECT 1 FROM raw_batches WHERE batch_id = %s", (batch_id,)).fetchone()
     return row is not None

@@ -188,6 +188,17 @@ class RawFrameBatch(BaseModel):
     frames: list[RawFrame]
 
 
+class DeviceUpdate(BaseModel):
+    display_name: str = Field(..., min_length=1, max_length=80)
+
+    @field_validator("display_name", mode="before")
+    @classmethod
+    def trim_display_name(cls, value):
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+
 @app.get("/healthz")
 def healthz():
     try:
@@ -285,6 +296,27 @@ def get_me(auth: AuthContext = Depends(require_auth)):
 def get_devices(auth: AuthContext = Depends(require_auth)):
     with psycopg.connect(cfg.db_dsn) as conn:
         return read.list_devices(conn, user_id=None if auth.is_admin else auth.user_id)
+
+
+@app.patch("/v1/devices/{device_id}")
+def update_device(
+    device_id: str,
+    body: DeviceUpdate,
+    auth: AuthContext = Depends(require_auth),
+):
+    with psycopg.connect(cfg.db_dsn) as conn:
+        owner = conn.execute(
+            "SELECT user_id FROM device_owners WHERE device_id = %s",
+            (device_id,),
+        ).fetchone()
+        if owner is None:
+            raise HTTPException(status_code=404, detail="owned device not found")
+        if not auth.is_admin and owner[0] != auth.user_id:
+            raise HTTPException(status_code=403, detail="device is owned by another user")
+
+        store.set_device_display_name(conn, device_id, body.display_name)
+        conn.commit()
+    return {"device_id": device_id, "display_name": body.display_name}
 
 
 @app.get("/v1/batches", dependencies=[Depends(require_admin_auth)])

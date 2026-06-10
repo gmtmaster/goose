@@ -51,18 +51,27 @@ _DOWNSAMPLE = {
 def list_devices(conn, user_id=None):
     if user_id is None:
         rows = conn.execute(
-            "SELECT device_id, mac, name, first_seen, last_seen FROM devices ORDER BY device_id"
+            """SELECT d.device_id, o.display_name, o.user_id, u.name, u.email,
+                      o.created_at, d.last_seen
+               FROM devices d
+               LEFT JOIN device_owners o ON o.device_id = d.device_id
+               LEFT JOIN users u ON u.id = o.user_id
+               ORDER BY d.device_id"""
         ).fetchall()
+        cols = [
+            "device_id", "display_name", "owner_user_id", "owner_name",
+            "owner_email", "created_at", "last_seen",
+        ]
     else:
         rows = conn.execute(
-            """SELECT d.device_id, d.mac, d.name, d.first_seen, d.last_seen
+            """SELECT d.device_id, o.display_name, o.nickname, o.created_at, d.last_seen
                FROM devices d
                JOIN device_owners o ON o.device_id = d.device_id
                WHERE o.user_id = %s
                ORDER BY d.device_id""",
             (user_id,),
         ).fetchall()
-    cols = ["device_id", "mac", "name", "first_seen", "last_seen"]
+        cols = ["device_id", "display_name", "nickname", "created_at", "last_seen"]
     return [dict(zip(cols, r)) for r in rows]
 
 
