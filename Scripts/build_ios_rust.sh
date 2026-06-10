@@ -46,7 +46,7 @@ case "$PLATFORM_NAME" in
     ;;
   iphonesimulator)
     SDK_NAME="iphonesimulator"
-    if [[ "$CURRENT_ARCH" == *"x86_64"* && "$CURRENT_ARCH" != *"arm64"* ]]; then
+    if [[ "$(uname -m)" == "x86_64" ]]; then
       RUST_TARGET="x86_64-apple-ios"
       CLANG_TARGET="x86_64-apple-ios$IOS_DEPLOYMENT_TARGET-simulator"
     else
