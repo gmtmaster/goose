@@ -1,5 +1,6 @@
 """Bearer-token authentication and device ownership helpers."""
 import hashlib
+import hmac
 import secrets
 from dataclasses import dataclass
 from uuid import UUID
@@ -25,6 +26,36 @@ def hash_api_token(token: str) -> str:
 
 def token_prefix(token: str, length: int = 10) -> str:
     return token[:length]
+
+
+def hash_password(password: str, *, salt: bytes | None = None) -> str:
+    """Hash a password with stdlib PBKDF2; the encoded value includes its salt."""
+    salt = salt or secrets.token_bytes(16)
+    iterations = 600_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, encoded: str | None) -> bool:
+    if not encoded:
+        return False
+    try:
+        algorithm, iterations_raw, salt_hex, expected_hex = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        actual = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes.fromhex(salt_hex),
+            int(iterations_raw),
+        )
+        return hmac.compare_digest(actual.hex(), expected_hex)
+    except (ValueError, TypeError):
+        return False
+
+
+def generate_api_token() -> str:
+    return f"goose_{secrets.token_urlsafe(32)}"
 
 
 def _bearer_token(authorization: str) -> str:
@@ -91,3 +122,12 @@ def authorize_device(
         return
     if owner[0] != auth.user_id:
         raise HTTPException(status_code=403, detail="device is owned by another user")
+
+
+def require_owned_device(
+    conn: psycopg.Connection,
+    auth: AuthContext,
+    device_id: str,
+) -> None:
+    """Require an existing ownership row for user requests; admins remain unrestricted."""
+    authorize_device(conn, auth, device_id, auto_bind=False)

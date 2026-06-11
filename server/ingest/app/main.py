@@ -5,8 +5,10 @@ import logging
 import os
 import threading
 import time
+import uuid
 
 import psycopg
+from psycopg.errors import UniqueViolation
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,7 +16,18 @@ from pydantic import BaseModel, Field, field_validator
 
 from . import db, ingest, read, store
 from .analysis import daily
-from .auth import AuthContext, authorize_device, require_admin_auth, require_auth
+from .auth import (
+    AuthContext,
+    authorize_device,
+    generate_api_token,
+    hash_api_token,
+    hash_password,
+    require_admin_auth,
+    require_auth,
+    require_owned_device,
+    token_prefix,
+    verify_password,
+)
 from .config import load_config
 
 _log = logging.getLogger("goose.ingest")
@@ -199,6 +212,104 @@ class DeviceUpdate(BaseModel):
         return value
 
 
+class SignupBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=8, max_length=256)
+
+    @field_validator("name", "email", mode="before")
+    @classmethod
+    def trim_identity_fields(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        value = value.lower()
+        if "@" not in value:
+            raise ValueError("invalid email")
+        return value
+
+
+class LoginBody(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=1, max_length=256)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_login_email(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
+
+
+class DeviceClaim(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=160)
+    name: str | None = Field(default=None, max_length=80)
+    device_type: str = Field(default="whoop", min_length=1, max_length=40)
+
+    @field_validator("device_id", "name", "device_type", mode="before")
+    @classmethod
+    def trim_claim_fields(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class MockMetric(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=160)
+    heart_rate: int | None = Field(default=None, ge=0, le=300)
+    battery: float | None = Field(default=None, ge=0, le=100)
+    recorded_at: _dt.datetime | None = None
+
+
+def _auth_response(user_id, name, email, raw_token):
+    return {
+        "user": {"id": str(user_id), "name": name, "email": email},
+        "api_token": raw_token,
+        "token_type": "bearer",
+    }
+
+
+@app.post("/v1/auth/signup", status_code=201)
+@app.post("/auth/signup", status_code=201, include_in_schema=False)
+def signup(body: SignupBody):
+    user_id = uuid.uuid4()
+    raw_token = generate_api_token()
+    try:
+        with psycopg.connect(cfg.db_dsn) as conn:
+            conn.execute(
+                """INSERT INTO users (id, name, email, password_hash)
+                   VALUES (%s, %s, %s, %s)""",
+                (user_id, body.name, body.email, hash_password(body.password)),
+            )
+            conn.execute(
+                """INSERT INTO api_tokens (id, user_id, token_hash, token_prefix)
+                   VALUES (%s, %s, %s, %s)""",
+                (uuid.uuid4(), user_id, hash_api_token(raw_token), token_prefix(raw_token)),
+            )
+            conn.commit()
+    except UniqueViolation:
+        raise HTTPException(status_code=409, detail="account already exists")
+    return _auth_response(user_id, body.name, body.email, raw_token)
+
+
+@app.post("/v1/auth/login")
+@app.post("/auth/login", include_in_schema=False)
+def login(body: LoginBody):
+    with psycopg.connect(cfg.db_dsn) as conn:
+        user = conn.execute(
+            "SELECT id, name, email, password_hash FROM users WHERE email = %s",
+            (body.email,),
+        ).fetchone()
+        if user is None or not verify_password(body.password, user[3]):
+            raise HTTPException(status_code=401, detail="invalid email or password")
+        raw_token = generate_api_token()
+        conn.execute(
+            """INSERT INTO api_tokens (id, user_id, token_hash, token_prefix)
+               VALUES (%s, %s, %s, %s)""",
+            (uuid.uuid4(), user[0], hash_api_token(raw_token), token_prefix(raw_token)),
+        )
+        conn.commit()
+    return _auth_response(user[0], user[1], user[2], raw_token)
+
+
 @app.get("/healthz")
 def healthz():
     try:
@@ -215,7 +326,7 @@ def ingest_batch(batch: IngestBatch, auth: AuthContext = Depends(require_auth)):
     with psycopg.connect(cfg.db_dsn) as conn:
         device = payload["device"]
         store.ensure_device(conn, device["device_id"], mac=device.get("mac"), name=device.get("name"))
-        authorize_device(conn, auth, device["device_id"], auto_bind=True)
+        authorize_device(conn, auth, device["device_id"], auto_bind=False)
         result = ingest.process_batch(conn, cfg, payload)
         conn.commit()
     return result
@@ -241,7 +352,7 @@ def ingest_decoded(batch: DecodedBatch, auth: AuthContext = Depends(require_auth
         store.ensure_device(conn, device_id,
                             mac=payload["device"].get("mac"),
                             name=payload["device"].get("name"))
-        authorize_device(conn, auth, device_id, auto_bind=True)
+        authorize_device(conn, auth, device_id, auto_bind=False)
         counts = store.upsert_streams(conn, device_id, payload["streams"])
         conn.commit()
         # Recompute the day(s) this batch touched — throttled (see _RECOMPUTE_*).
@@ -276,7 +387,7 @@ def ingest_frames(batch: RawFrameBatch, auth: AuthContext = Depends(require_auth
             mac=payload["device"].get("mac"),
             name=payload["device"].get("name"),
         )
-        authorize_device(conn, auth, device_id, auto_bind=True)
+        authorize_device(conn, auth, device_id, auto_bind=False)
         inserted = store.insert_raw_frames(conn, device_id, payload["frames"])
         conn.commit()
     return {"inserted": inserted}
@@ -296,6 +407,119 @@ def get_me(auth: AuthContext = Depends(require_auth)):
 def get_devices(auth: AuthContext = Depends(require_auth)):
     with psycopg.connect(cfg.db_dsn) as conn:
         return read.list_devices(conn, user_id=None if auth.is_admin else auth.user_id)
+
+
+@app.post("/v1/devices/claim")
+@app.post("/devices/claim", include_in_schema=False)
+def claim_device(body: DeviceClaim, auth: AuthContext = Depends(require_auth)):
+    if auth.is_admin or auth.user_id is None:
+        raise HTTPException(status_code=403, detail="an account token is required")
+    with psycopg.connect(cfg.db_dsn) as conn:
+        store.ensure_device(conn, body.device_id, name=body.name)
+        conn.execute(
+            """UPDATE devices
+               SET device_type = %s, name = COALESCE(%s, name), last_seen = now()
+               WHERE device_id = %s""",
+            (body.device_type.lower(), body.name, body.device_id),
+        )
+        conn.execute("SELECT device_id FROM devices WHERE device_id = %s FOR UPDATE", (body.device_id,))
+        owner = conn.execute(
+            "SELECT user_id, display_name FROM device_owners WHERE device_id = %s",
+            (body.device_id,),
+        ).fetchone()
+        if owner is not None and owner[0] != auth.user_id:
+            raise HTTPException(status_code=409, detail="device is already claimed")
+        if owner is None:
+            conn.execute(
+                """INSERT INTO device_owners (device_id, user_id, display_name)
+                   VALUES (%s, %s, %s)""",
+                (body.device_id, auth.user_id, body.name),
+            )
+        elif body.name is not None:
+            conn.execute(
+                "UPDATE device_owners SET display_name = %s WHERE device_id = %s",
+                (body.name, body.device_id),
+            )
+        conn.commit()
+    return {
+        "device_id": body.device_id,
+        "name": body.name if body.name is not None else (owner[1] if owner else None),
+        "device_type": body.device_type.lower(),
+        "claimed": True,
+    }
+
+
+@app.delete("/v1/devices/{device_id}/claim")
+@app.delete("/devices/{device_id}/claim", include_in_schema=False)
+def unclaim_device(device_id: str, auth: AuthContext = Depends(require_auth)):
+    if auth.is_admin or auth.user_id is None:
+        raise HTTPException(status_code=403, detail="an account token is required")
+    with psycopg.connect(cfg.db_dsn) as conn:
+        owner = conn.execute(
+            "SELECT user_id FROM device_owners WHERE device_id = %s FOR UPDATE",
+            (device_id,),
+        ).fetchone()
+        if owner is None:
+            raise HTTPException(status_code=404, detail="claimed device not found")
+        if owner[0] != auth.user_id:
+            raise HTTPException(status_code=403, detail="device is owned by another user")
+        conn.execute(
+            "DELETE FROM device_owners WHERE device_id = %s AND user_id = %s",
+            (device_id, auth.user_id),
+        )
+        conn.commit()
+    return {"device_id": device_id, "claimed": False}
+
+
+@app.post("/v1/metrics", status_code=201)
+@app.post("/metrics", status_code=201, include_in_schema=False)
+def insert_mock_metric(body: MockMetric, auth: AuthContext = Depends(require_auth)):
+    if auth.is_admin or auth.user_id is None:
+        raise HTTPException(status_code=403, detail="an account token is required")
+    if body.heart_rate is None and body.battery is None:
+        raise HTTPException(status_code=422, detail="heart_rate or battery is required")
+    recorded_at = body.recorded_at or _dt.datetime.now(_dt.timezone.utc)
+    metric_id = uuid.uuid4()
+    with psycopg.connect(cfg.db_dsn) as conn:
+        require_owned_device(conn, auth, body.device_id)
+        conn.execute(
+            """INSERT INTO mock_metrics
+               (id, user_id, device_id, recorded_at, heart_rate, battery)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (
+                metric_id, auth.user_id, body.device_id, recorded_at,
+                body.heart_rate, body.battery,
+            ),
+        )
+        conn.commit()
+    return {
+        "id": str(metric_id),
+        "device_id": body.device_id,
+        "recorded_at": recorded_at,
+        "heart_rate": body.heart_rate,
+        "battery": body.battery,
+    }
+
+
+@app.get("/v1/metrics")
+@app.get("/metrics", include_in_schema=False)
+def get_mock_metrics(
+    device_id: str | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    auth: AuthContext = Depends(require_auth),
+):
+    if auth.is_admin or auth.user_id is None:
+        raise HTTPException(status_code=403, detail="an account token is required")
+    with psycopg.connect(cfg.db_dsn) as conn:
+        if device_id is not None:
+            require_owned_device(conn, auth, device_id)
+        rows = read.list_mock_metrics(
+            conn,
+            user_id=auth.user_id,
+            device_id=device_id,
+            limit=limit,
+        )
+    return rows
 
 
 @app.patch("/v1/devices/{device_id}")

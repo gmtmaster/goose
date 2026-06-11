@@ -7,9 +7,11 @@ CREATE TABLE IF NOT EXISTS devices (
     device_id   TEXT PRIMARY KEY,
     mac         TEXT,
     name        TEXT,
+    device_type TEXT NOT NULL DEFAULT 'whoop',
     first_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_type TEXT NOT NULL DEFAULT 'whoop';
 
 -- Minimal multi-tenant identity and device ownership. API tokens are generated
 -- with high entropy and only their SHA-256 digest is stored.
@@ -17,8 +19,10 @@ CREATE TABLE IF NOT EXISTS users (
     id          UUID PRIMARY KEY,
     name        TEXT,
     email       TEXT UNIQUE NOT NULL,
+    password_hash TEXT,
     created_at  TIMESTAMPTZ DEFAULT now()
 );
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
 
 CREATE TABLE IF NOT EXISTS api_tokens (
     id           UUID PRIMARY KEY,
@@ -43,6 +47,21 @@ ALTER TABLE device_owners ADD COLUMN IF NOT EXISTS display_name TEXT;
 -- leaves room for a future sharing migration, while this index enforces today's
 -- exclusive-owner rule and closes concurrent first-upload races.
 CREATE UNIQUE INDEX IF NOT EXISTS device_owners_device_id ON device_owners (device_id);
+
+-- Account-stamped manual metrics used by the pre-BLE ownership flow. Keeping the
+-- user id on each row preserves historical ownership across unclaim/reclaim.
+CREATE TABLE IF NOT EXISTS mock_metrics (
+    id          UUID PRIMARY KEY,
+    user_id     UUID NOT NULL REFERENCES users(id),
+    device_id   TEXT NOT NULL REFERENCES devices(device_id),
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    heart_rate  SMALLINT CHECK (heart_rate >= 0 AND heart_rate <= 300),
+    battery     REAL CHECK (battery >= 0 AND battery <= 100)
+);
+CREATE INDEX IF NOT EXISTS mock_metrics_user_time
+    ON mock_metrics (user_id, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS mock_metrics_device_time
+    ON mock_metrics (device_id, recorded_at DESC);
 
 CREATE TABLE IF NOT EXISTS raw_batches (
     batch_id          TEXT PRIMARY KEY,  -- opaque idempotency key (UUID from live/Mac; "hist-<device>-<trim>" from backfill)

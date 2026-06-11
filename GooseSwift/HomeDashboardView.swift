@@ -229,4 +229,3 @@ struct HomeDashboardView: View {
     model.recordUIAction("coach.opened", detail: "Home daily score card")
   }
 }
-

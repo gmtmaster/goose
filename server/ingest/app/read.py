@@ -75,6 +75,25 @@ def list_devices(conn, user_id=None):
     return [dict(zip(cols, r)) for r in rows]
 
 
+def list_mock_metrics(conn, user_id, device_id=None, limit=100):
+    filters = ["user_id = %s"]
+    params = [user_id]
+    if device_id is not None:
+        filters.append("device_id = %s")
+        params.append(device_id)
+    params.append(limit)
+    rows = conn.execute(
+        """SELECT id::text, device_id, recorded_at, heart_rate, battery
+           FROM mock_metrics
+           WHERE """ + " AND ".join(filters) + """
+           ORDER BY recorded_at DESC
+           LIMIT %s""",
+        params,
+    ).fetchall()
+    cols = ["id", "device_id", "recorded_at", "heart_rate", "battery"]
+    return [dict(zip(cols, row)) for row in rows]
+
+
 def list_batches(conn, device_id, limit=100):
     rows = conn.execute(
         """SELECT batch_id::text, device_id, received_at, start_ts, end_ts, packet_count,

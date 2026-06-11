@@ -37,8 +37,8 @@ def _create_token(dsn, name, email, raw_token):
 
 def _claim(client, token, device_id):
     response = client.post(
-        "/v1/ingest-decoded",
-        json={"device": {"id": device_id}, "streams": {}},
+        "/v1/devices/claim",
+        json={"device_id": device_id, "name": "Test WHOOP", "device_type": "whoop"},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 200, response.text

@@ -4,6 +4,7 @@ import SwiftUI
 struct GooseSwiftApp: App {
   @Environment(\.scenePhase) private var scenePhase
   @State private var model = GooseAppModel()
+  @State private var accountSession = AccountSession()
   @StateObject private var router = AppRouter()
 
   init() {
@@ -14,6 +15,7 @@ struct GooseSwiftApp: App {
     WindowGroup {
       RootView()
         .environment(model)
+        .environment(accountSession)
         .environmentObject(model.packetMonitor)
         .environmentObject(model.ble.messageStore)
         .environmentObject(router)

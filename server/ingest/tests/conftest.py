@@ -67,7 +67,7 @@ def clean_db(timescale_dsn):
     """Truncate all data tables before each test for isolation."""
     import psycopg
     with psycopg.connect(timescale_dsn, autocommit=True) as c:
-        c.execute("TRUNCATE users, api_tokens, device_owners, devices, raw_batches, raw_frames, "
+        c.execute("TRUNCATE users, api_tokens, device_owners, mock_metrics, devices, raw_batches, raw_frames, "
                   "hr_samples, rr_intervals, events, battery, "
                   "spo2_samples, skin_temp_samples, resp_samples, gravity_samples, "
                   "sleep_sessions, exercise_sessions, daily_metrics, profile CASCADE")
