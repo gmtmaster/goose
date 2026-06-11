@@ -6,6 +6,7 @@ struct GooseSwiftApp: App {
   @UIApplicationDelegateAdaptor(GooseAppDelegate.self) private var appDelegate
   @Environment(\.scenePhase) private var scenePhase
   @State private var model = GooseAppModel()
+  @State private var accountSession = AccountSession()
   @StateObject private var router = AppRouter()
 
   // Weak reference used by the BGTask handler closure to reach the model.
@@ -36,6 +37,7 @@ struct GooseSwiftApp: App {
     WindowGroup {
       RootView()
         .environment(model)
+        .environment(accountSession)
         .environmentObject(model.packetMonitor)
         .environmentObject(model.ble.messageStore)
         .environmentObject(router)
